@@ -1,0 +1,2011 @@
+# main.py
+
+import sys
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QStackedWidget, QLineEdit, QTableWidget,
+    QTableWidgetItem, QCheckBox, QDateEdit, QMessageBox, QComboBox,
+    QDateTimeEdit, QTextEdit, QGridLayout, QFrame, QFileDialog, QHeaderView
+)
+from PyQt6.QtCore import Qt, QDate, QDateTime
+from PyQt6.QtGui import QFont # Import QFont for setting application font
+
+from sqlalchemy import create_engine, Column, Integer, String, Date, Boolean, ForeignKey, Float, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.exc import IntegrityError
+from datetime import date, datetime, timedelta
+import pandas as pd
+from fpdf import FPDF
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+
+# --- نصب کتابخانه‌های مورد نیاز (قبل از اجرا) ---
+# pip install PyQt6 SQLAlchemy pandas fpdf2 matplotlib jdatetime
+import jdatetime # Import jdatetime for Shamsi date conversion
+
+# --- فایل فونت برای PDF (اختیاری، برای پشتیبانی فارسی) ---
+# برای اینکه گزارشات PDF به درستی حروف فارسی را نمایش دهند، نیاز به یک فونت
+# یونیکد (مانند NotoSansArabic-Regular.ttf یا Arial Unicode MS) دارید
+# که باید آن را دانلود کرده و در کنار فایل اجرایی یا در پوشه ای که برنامه به آن دسترسی دارد، قرار دهید.
+# مثال: FONT_PATH = "NotoSansArabic-Regular.ttf"
+FONT_PATH = "arial-unicode-ms.ttf" # نام فایل فونت
+# اگر از یک فونت دیگر استفاده می کنید، نام آن را در اینجا تغییر دهید.
+
+# --- ۱. ماژول‌ها و مدل‌های پایگاه داده ---
+DATABASE_FILE = 'transport_management.db'
+Base = declarative_base()
+engine = create_engine(f'sqlite:///{DATABASE_FILE}')
+
+class Driver(Base):
+    __tablename__ = 'drivers'
+    id = Column(Integer, primary_key=True)
+    first_name = Column(String, nullable=False)
+    last_name = Column(String, nullable=False)
+    national_code = Column(String, unique=True, nullable=False)
+    phone_number = Column(String)
+    address = Column(String)
+    hire_date = Column(Date)
+    is_active = Column(Boolean, default=True)
+    license_expiry_date = Column(Date)
+    health_card_expiry_date = Column(Date)
+
+    def __repr__(self):
+        return f"<Driver(id={self.id}, name='{self.first_name} {self.last_name}')>"
+
+class Vehicle(Base):
+    __tablename__ = 'vehicles'
+    id = Column(Integer, primary_key=True)
+    type = Column(String, nullable=False) # e.g., کامیون، وانت، سواری
+    model = Column(String)
+    year = Column(Integer)
+    plate_number = Column(String, unique=True, nullable=False)
+    vin_number = Column(String)
+    status = Column(String, default='Available') # Available, On Mission, In Repair
+    insurance_expiry_date = Column(Date)
+    inspection_expiry_date = Column(Date)
+    fuel_consumption = Column(Float) # Average consumption
+    last_service_date = Column(Date)
+
+    def __repr__(self):
+        return f"<Vehicle(id={self.id}, plate='{self.plate_number}')>"
+
+class Shift(Base):
+    __tablename__ = 'shifts'
+    id = Column(Integer, primary_key=True)
+    name = Column(String, unique=True, nullable=False) # e.g., شیفت صبح
+    start_time = Column(String) # e.g., 08:00
+    end_time = Column(String) # e.g., 16:00
+
+class DriverShift(Base):
+    __tablename__ = 'driver_shifts'
+    id = Column(Integer, primary_key=True)
+    driver_id = Column(Integer, ForeignKey('drivers.id'), nullable=False)
+    shift_id = Column(Integer, ForeignKey('shifts.id'), nullable=False)
+    shift_date = Column(Date, nullable=False)
+    driver = relationship('Driver')
+    shift = relationship('Shift')
+
+class Mission(Base):
+    __tablename__ = 'missions'
+    id = Column(Integer, primary_key=True)
+    driver_id = Column(Integer, ForeignKey('drivers.id'), nullable=False)
+    vehicle_id = Column(Integer, ForeignKey('vehicles.id'), nullable=False)
+    start_date_time = Column(String, nullable=False)
+    end_date_time_predicted = Column(String)
+    end_date_time_actual = Column(String)
+    origin = Column(String, nullable=False)
+    destination = Column(String, nullable=False)
+    cargo_description = Column(Text)
+    recipient_sender = Column(String)
+    status = Column(String, default='Pending') # Pending, In Progress, Completed, Canceled
+    fuel_cost = Column(Float)
+    toll_fees = Column(Float)
+    minor_repairs_cost = Column(Float)
+
+    driver = relationship('Driver')
+    vehicle = relationship('Vehicle')
+
+    def __repr__(self):
+        return f"<Mission(id={self.id}, status='{self.status}')>"
+
+def init_db():
+    """Initializes the database by creating all defined tables."""
+    Base.metadata.create_all(engine)
+    print("Database initialized.")
+
+Session = sessionmaker(bind=engine)
+
+# --- ۲. کنترلرها (منطق کسب‌وکار) ---
+
+class DriverController:
+    """Manages driver data and database interactions."""
+    def __init__(self, session):
+        self.session = session
+
+    def add_driver(self, first_name, last_name, national_code, phone_number, address, hire_date, is_active, license_expiry_date, health_card_expiry_date):
+        """Adds a new driver to the database."""
+        try:
+            new_driver = Driver(
+                first_name=first_name,
+                last_name=last_name,
+                national_code=national_code,
+                phone_number=phone_number,
+                address=address,
+                hire_date=hire_date,
+                is_active=is_active,
+                license_expiry_date=license_expiry_date,
+                health_card_expiry_date=health_card_expiry_date
+            )
+            self.session.add(new_driver)
+            self.session.commit()
+            return True, "راننده با موفقیت اضافه شد."
+        except IntegrityError:
+            self.session.rollback()
+            return False, "کد ملی تکراری است."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در اضافه کردن راننده: {e}"
+
+    def get_all_drivers(self):
+        """Retrieves all drivers from the database."""
+        return self.session.query(Driver).all()
+
+    def get_driver_by_id(self, driver_id):
+        """Retrieves a driver by their ID."""
+        return self.session.query(Driver).get(driver_id)
+
+    def update_driver(self, driver_id, **kwargs):
+        """Updates an existing driver's information."""
+        try:
+            driver = self.get_driver_by_id(driver_id)
+            if driver:
+                for key, value in kwargs.items():
+                    setattr(driver, key, value)
+                self.session.commit()
+                return True, "اطلاعات راننده با موفقیت به‌روز شد."
+            return False, "راننده یافت نشد."
+        except IntegrityError:
+            self.session.rollback()
+            return False, "کد ملی تکراری است."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در به‌روزرسانی راننده: {e}"
+
+    def delete_driver(self, driver_id):
+        """Deletes a driver from the database."""
+        try:
+            driver = self.get_driver_by_id(driver_id)
+            if driver:
+                self.session.delete(driver)
+                self.session.commit()
+                return True, "راننده با موفقیت حذف شد."
+            return False, "راننده یافت نشد."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در حذف راننده: {e}"
+
+class VehicleController:
+    """Manages vehicle data and database interactions."""
+    def __init__(self, session):
+        self.session = session
+
+    def add_vehicle(self, type, model, year, plate_number, vin_number, status, insurance_expiry_date, inspection_expiry_date, fuel_consumption, last_service_date):
+        """Adds a new vehicle to the database."""
+        try:
+            new_vehicle = Vehicle(
+                type=type,
+                model=model,
+                year=year,
+                plate_number=plate_number,
+                vin_number=vin_number,
+                status=status,
+                insurance_expiry_date=insurance_expiry_date,
+                inspection_expiry_date=inspection_expiry_date,
+                fuel_consumption=fuel_consumption,
+                last_service_date=last_service_date
+            )
+            self.session.add(new_vehicle)
+            self.session.commit()
+            return True, "وسیله نقلیه با موفقیت اضافه شد."
+        except IntegrityError:
+            self.session.rollback()
+            return False, "شماره پلاک تکراری است."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در اضافه کردن وسیله نقلیه: {e}"
+
+    def get_all_vehicles(self):
+        """Retrieves all vehicles from the database."""
+        return self.session.query(Vehicle).all()
+
+    def get_vehicle_by_id(self, vehicle_id):
+        """Retrieves a vehicle by its ID."""
+        return self.session.query(Vehicle).get(vehicle_id)
+
+    def update_vehicle(self, vehicle_id, **kwargs):
+        """Updates an existing vehicle's information."""
+        try:
+            vehicle = self.get_vehicle_by_id(vehicle_id)
+            if vehicle:
+                for key, value in kwargs.items():
+                    setattr(vehicle, key, value)
+                self.session.commit()
+                return True, "اطلاعات وسیله نقلیه با موفقیت به‌روز شد."
+            return False, "وسیله نقلیه یافت نشد."
+        except IntegrityError:
+            self.session.rollback()
+            return False, "شماره پلاک تکراری است."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در به‌روزرسانی وسیله نقلیه: {e}"
+
+    def delete_vehicle(self, vehicle_id):
+        """Deletes a vehicle from the database."""
+        try:
+            vehicle = self.get_vehicle_by_id(vehicle_id)
+            if vehicle:
+                self.session.delete(vehicle)
+                self.session.commit()
+                return True, "وسیله نقلیه با موفقیت حذف شد."
+            return False, "وسیله نقلیه یافت نشد."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در حذف وسیله نقلیه: {e}"
+
+class ShiftController:
+    """Manages shift types and driver shift assignments."""
+    def __init__(self, session):
+        self.session = session
+
+    def add_shift_type(self, name, start_time, end_time):
+        """Adds a new shift type."""
+        try:
+            new_shift = Shift(name=name, start_time=start_time, end_time=end_time)
+            self.session.add(new_shift)
+            self.session.commit()
+            return True, "نوع شیفت با موفقیت اضافه شد."
+        except IntegrityError:
+            self.session.rollback()
+            return False, "نوع شیفت با این نام قبلاً وجود دارد."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در اضافه کردن نوع شیفت: {e}"
+
+    def get_all_shift_types(self):
+        """Retrieves all defined shift types."""
+        return self.session.query(Shift).all()
+
+    def assign_shift_to_driver(self, driver_id, shift_id, shift_date):
+        """Assigns a shift to a driver on a specific date."""
+        try:
+            existing_shift = self.session.query(DriverShift).filter_by(
+                driver_id=driver_id,
+                shift_date=shift_date
+            ).first()
+            if existing_shift:
+                return False, "راننده قبلاً در این تاریخ شیفت دارد."
+
+            new_driver_shift = DriverShift(
+                driver_id=driver_id,
+                shift_id=shift_id,
+                shift_date=shift_date
+            )
+            self.session.add(new_driver_shift)
+            self.session.commit()
+            return True, "شیفت با موفقیت به راننده اختصاص یافت."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در تخصیص شیفت: {e}"
+
+    def get_driver_shifts(self, driver_id=None, shift_date=None):
+        """Retrieves assigned shifts for drivers, optionally filtered by driver ID or date."""
+        query = self.session.query(DriverShift).join(Driver).join(Shift)
+        if driver_id:
+            query = query.filter(DriverShift.driver_id == driver_id)
+        if shift_date:
+            query = query.filter(DriverShift.shift_date == shift_date)
+        return query.all()
+
+    def delete_driver_shift(self, driver_shift_id):
+        """Deletes a specific driver shift assignment."""
+        try:
+            shift = self.session.query(DriverShift).get(driver_shift_id)
+            if shift:
+                self.session.delete(shift)
+                self.session.commit()
+                return True, "شیفت تخصیص یافته با موفقیت حذف شد."
+            return False, "شیفت یافت نشد."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در حذف شیفت: {e}"
+
+class MissionController:
+    """Manages mission data and lifecycle."""
+    def __init__(self, session):
+        self.session = session
+
+    def add_mission(self, driver_id, vehicle_id, start_date_time, end_date_time_predicted, origin, destination, cargo_description, recipient_sender):
+        """Adds a new mission and updates vehicle status."""
+        try:
+            new_mission = Mission(
+                driver_id=driver_id,
+                vehicle_id=vehicle_id,
+                start_date_time=start_date_time,
+                end_date_time_predicted=end_date_time_predicted,
+                origin=origin,
+                destination=destination,
+                cargo_description=cargo_description,
+                recipient_sender=recipient_sender,
+                status='Pending'
+            )
+            self.session.add(new_mission)
+            vehicle = self.session.query(Vehicle).get(vehicle_id)
+            if vehicle:
+                vehicle.status = "On Mission"
+            self.session.commit()
+            return True, "ماموریت با موفقیت ثبت شد."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در ثبت ماموریت: {e}"
+
+    def get_all_missions(self):
+        """Retrieves all missions with associated driver and vehicle data."""
+        return self.session.query(Mission).join(Driver).join(Vehicle).all()
+
+    def get_mission_by_id(self, mission_id):
+        """Retrieves a mission by its ID."""
+        return self.session.query(Mission).get(mission_id)
+
+    def update_mission_status(self, mission_id, new_status, actual_end_time=None, fuel_cost=None, toll_fees=None, minor_repairs_cost=None):
+        """Updates a mission's status and related completion details."""
+        try:
+            mission = self.get_mission_by_id(mission_id)
+            if mission:
+                mission.status = new_status
+                if actual_end_time:
+                    mission.end_date_time_actual = actual_end_time
+                if fuel_cost is not None:
+                    mission.fuel_cost = fuel_cost
+                if toll_fees is not None:
+                    mission.toll_fees = toll_fees
+                if minor_repairs_cost is not None:
+                    mission.minor_repairs_cost = minor_repairs_cost
+
+                if new_status == 'Completed' or new_status == 'Canceled':
+                    vehicle = self.session.query(Vehicle).get(mission.vehicle_id)
+                    if vehicle:
+                        vehicle.status = "Available"
+                self.session.commit()
+                return True, "وضعیت ماموریت با موفقیت به‌روز شد."
+            return False, "ماموریت یافت نشد."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در به‌روزرسانی وضعیت ماموریت: {e}"
+
+    def delete_mission(self, mission_id):
+        """Deletes a mission and reverts vehicle status if necessary."""
+        try:
+            mission = self.get_mission_by_id(mission_id)
+            if mission:
+                if mission.status == "On Mission":
+                    vehicle = self.session.query(Vehicle).get(mission.vehicle_id)
+                    if vehicle:
+                        vehicle.status = "Available"
+                self.session.delete(mission)
+                self.session.commit()
+                return True, "ماموریت با موفقیت حذف شد."
+            return False, "ماموریت یافت نشد."
+        except Exception as e:
+            self.session.rollback()
+            return False, f"خطا در حذف ماموریت: {e}"
+
+# --- ۳. کلاس کمکی تبدیل تاریخ شمسی/میلادی (با استفاده از jdatetime) ---
+class ShamsiDateConverter:
+    """Helper class for converting between Gregorian and Shamsi (Jalali) dates using jdatetime."""
+    def __init__(self):
+        pass
+
+    def gregorian_to_shamsi(self, gd: date):
+        """Converts a Gregorian date (date object) to a Shamsi string (YYYY/MM/DD)."""
+        if not gd: return ""
+        try:
+            jd = jdatetime.date.fromgregorian(date=gd)
+            return jd.strftime("%Y/%m/%d")
+        except Exception:
+            return "" # Fallback if conversion fails
+
+    def shamsi_to_gregorian(self, sd: str):
+        """Converts a Shamsi date string (YYYY/MM/DD) to a Gregorian date object."""
+        if not sd: return None
+        try:
+            year, month, day = map(int, sd.split('/'))
+            jd = jdatetime.date(year, month, day)
+            return jd.togregorian()
+        except ValueError:
+            return None
+        except Exception:
+            return None
+
+    def qdate_to_shamsi(self, qd: QDate):
+        """Converts QDate (Gregorian) to Shamsi string."""
+        if qd.isNull(): return ""
+        return self.gregorian_to_shamsi(qd.toPyDate())
+
+    def shamsi_to_qdate(self, sd: str):
+        """Converts Shamsi string to QDate (Gregorian)."""
+        g_date = self.shamsi_to_gregorian(sd)
+        if g_date:
+            return QDate(g_date)
+        return QDate() # Return null QDate if conversion fails
+
+    def qdatetime_to_shamsi_str(self, qdt: QDateTime):
+        """Converts QDateTime (Gregorian) to Shamsi string (YYYY/MM/DD HH:MM:SS)."""
+        if qdt.isNull(): return ""
+        g_date = qdt.date().toPyDate()
+        time_str = qdt.time().toString("HH:mm:ss")
+        shamsi_date_str = self.gregorian_to_shamsi(g_date)
+        return f"{shamsi_date_str} {time_str}"
+
+    def shamsi_str_to_qdatetime(self, sdt: str):
+        """Converts Shamsi datetime string (YYYY/MM/DD HH:MM:SS) to QDateTime (Gregorian)."""
+        if not sdt: return QDateTime()
+        try:
+            date_part, time_part = sdt.split(' ', 1)
+            g_date = self.shamsi_to_gregorian(date_part)
+            if g_date:
+                dt_obj = datetime.combine(g_date, datetime.strptime(time_part, "%H:%M:%S").time())
+                return QDateTime(dt_obj)
+            return QDateTime()
+        except Exception:
+            return QDateTime()
+
+# --- ۴. رابط کاربری (UI) ---
+
+class BaseWidget(QWidget):
+    """Base class for all module widgets, providing common styling and a back button."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.converter = ShamsiDateConverter()
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #f0f2f5;
+                color: #333;
+                font-family: "Segoe UI", Tahoma, Arial, sans-serif; /* Added Tahoma for broader compatibility */
+                font-size: 14px;
+            }
+            QLabel {
+                font-weight: bold;
+                color: #555;
+                margin-bottom: 5px;
+            }
+            QLineEdit, QTextEdit, QComboBox, QDateEdit, QDateTimeEdit {
+                background-color: #ffffff;
+                border: 1px solid #c0c0c0;
+                border-radius: 8px; /* Rounded corners */
+                padding: 8px;
+                color: #333;
+            }
+            QPushButton {
+                background-color: #007bff;
+                color: white;
+                border: none;
+                border-radius: 12px; /* More rounded */
+                padding: 10px 20px;
+                font-weight: bold;
+                margin: 5px;
+                min-width: 120px;
+                box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.2);
+            }
+            QPushButton:hover {
+                background-color: #0056b3;
+            }
+            QPushButton:pressed {
+                background-color: #003f80;
+                box-shadow: none;
+            }
+            QTableWidget {
+                background-color: #ffffff;
+                border: 1px solid #e0e0e0;
+                border-radius: 8px;
+                gridline-color: #e0e0e0;
+                selection-background-color: #d1ecf1;
+                selection-color: #0c5460;
+                color: #333;
+            }
+            QHeaderView::section {
+                background-color: #e9ecef;
+                color: #495057;
+                padding: 8px;
+                border: 1px solid #dee2e6;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QTableWidget::item {
+                padding: 5px;
+            }
+            QTableWidget::item:selected {
+                background-color: #d1ecf1;
+            }
+            QFrame {
+                background-color: #ffffff;
+                border: 1px solid #e0e0e0;
+                border-radius: 10px;
+                padding: 15px;
+                margin: 10px;
+                box-shadow: 3px 3px 8px rgba(0, 0, 0, 0.1);
+            }
+        """)
+
+        # Add a back button for navigation (handled by main app)
+        self.back_to_main_button = QPushButton("بازگشت به صفحه اصلی")
+        self.back_to_main_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                border-radius: 12px;
+                font-size: 14px;
+                padding: 8px 15px;
+                min-width: 100px;
+                box-shadow: 2px 2px 5px rgba(0, 0, 0, 0.2);
+            }
+            QPushButton:hover {
+                background-color: #d32f2f;
+            }
+        """)
+        # This button will be added to the layout of each derived widget in its init_ui method.
+
+class MainWindow(BaseWidget):
+    """Main application window with navigation buttons."""
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout.setContentsMargins(50, 50, 50, 50) # Add margins
+
+        title_label = QLabel("<h2>سیستم مدیریت حمل و نقل</h2>")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label.setStyleSheet("font-size: 32px; font-weight: bold; margin-bottom: 40px; color: #007bff;")
+        main_layout.addWidget(title_label)
+
+        button_grid_layout = QGridLayout()
+        button_grid_layout.setSpacing(20) # Spacing between buttons
+
+        self.driver_btn = self._create_nav_button("مدیریت رانندگان", "#28a745")
+        self.vehicle_btn = self._create_nav_button("مدیریت وسایل نقلیه", "#ffc107")
+        self.shift_btn = self._create_nav_button("مدیریت شیفت‌ها", "#17a2b8")
+        self.mission_btn = self._create_nav_button("مدیریت ماموریت‌ها", "#6f42c1")
+        self.dashboard_btn = self._create_nav_button("داشبورد", "#dc3545")
+        self.reports_btn = self._create_nav_button("گزارش‌گیری", "#6c757d")
+
+        button_grid_layout.addWidget(self.driver_btn, 0, 0)
+        button_grid_layout.addWidget(self.vehicle_btn, 0, 1)
+        button_grid_layout.addWidget(self.shift_btn, 0, 2)
+        button_grid_layout.addWidget(self.mission_btn, 1, 0)
+        button_grid_layout.addWidget(self.dashboard_btn, 1, 1)
+        button_grid_layout.addWidget(self.reports_btn, 1, 2)
+
+        main_layout.addLayout(button_grid_layout)
+
+    def _create_nav_button(self, text, color):
+        button = QPushButton(text)
+        button.setFixedSize(220, 80) # Larger buttons
+        button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {color};
+                color: white;
+                border-radius: 15px; /* More rounded */
+                font-size: 18px;
+                font-weight: bold;
+                padding: 15px;
+                box-shadow: 3px 3px 8px rgba(0, 0, 0, 0.3);
+                transition: background-color 0.3s, transform 0.3s;
+            }}
+            QPushButton:hover {{
+                background-color: {'#218838' if color == '#28a745' else
+                                  '#e0a800' if color == '#ffc107' else
+                                  '#138496' if color == '#17a2b8' else
+                                  '#5a33a5' if color == '#6f42c1' else
+                                  '#c82333' if color == '#dc3545' else
+                                  '#545b62' if color == '#6c757d' else
+                                  color}; /* Darker on hover */
+                transform: translateY(-3px); /* Slight lift effect */
+            }}
+            QPushButton:pressed {{
+                transform: translateY(0); /* Return to original position */
+                box-shadow: none;
+            }}
+        """)
+        return button
+
+class DriverManagementWidget(BaseWidget):
+    """Widget for managing driver information."""
+    def __init__(self, controller):
+        super().__init__()
+        self.controller = controller
+        self.init_ui()
+        self.load_drivers()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.addWidget(QLabel("<h2>مدیریت رانندگان</h2>", alignment=Qt.AlignmentFlag.AlignCenter))
+
+        form_frame = QFrame()
+        form_layout = QHBoxLayout(form_frame)
+
+        input_grid = QGridLayout()
+        self.id_input = QLineEdit()
+        self.id_input.setVisible(False) # Hidden ID field for update/delete operations
+
+        # Input fields for driver data
+        input_grid.addWidget(QLabel("نام:"), 0, 0)
+        self.first_name_input = QLineEdit()
+        input_grid.addWidget(self.first_name_input, 0, 1)
+
+        input_grid.addWidget(QLabel("نام خانوادگی:"), 1, 0)
+        self.last_name_input = QLineEdit()
+        input_grid.addWidget(self.last_name_input, 1, 1)
+
+        input_grid.addWidget(QLabel("کد ملی:"), 2, 0)
+        self.national_code_input = QLineEdit()
+        input_grid.addWidget(self.national_code_input, 2, 1)
+
+        input_grid.addWidget(QLabel("شماره تماس:"), 3, 0)
+        self.phone_number_input = QLineEdit()
+        input_grid.addWidget(self.phone_number_input, 3, 1)
+
+        input_grid.addWidget(QLabel("آدرس:"), 4, 0)
+        self.address_input = QLineEdit()
+        input_grid.addWidget(self.address_input, 4, 1)
+
+        input_grid.addWidget(QLabel("تاریخ استخدام:"), 5, 0)
+        self.hire_date_input = QDateEdit(calendarPopup=True)
+        self.hire_date_input.setDate(QDate.currentDate())
+        input_grid.addWidget(self.hire_date_input, 5, 1)
+
+        input_grid.addWidget(QLabel("تاریخ انقضای گواهینامه:"), 6, 0)
+        self.license_expiry_date_input = QDateEdit(calendarPopup=True)
+        self.license_expiry_date_input.setDate(QDate.currentDate().addYears(1))
+        input_grid.addWidget(self.license_expiry_date_input, 6, 1)
+
+        input_grid.addWidget(QLabel("تاریخ انقضای کارت سلامت:"), 7, 0)
+        self.health_card_expiry_date_input = QDateEdit(calendarPopup=True)
+        self.health_card_expiry_date_input.setDate(QDate.currentDate().addYears(1))
+        input_grid.addWidget(self.health_card_expiry_date_input, 7, 1)
+
+        input_grid.addWidget(QLabel("وضعیت فعال:"), 8, 0)
+        self.is_active_checkbox = QCheckBox("فعال")
+        self.is_active_checkbox.setChecked(True)
+        input_grid.addWidget(self.is_active_checkbox, 8, 1)
+
+        form_layout.addLayout(input_grid)
+
+        # Action buttons
+        button_v_layout = QVBoxLayout()
+        button_v_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.add_btn = QPushButton("افزودن راننده")
+        self.add_btn.clicked.connect(self.add_driver)
+        self.update_btn = QPushButton("به‌روزرسانی راننده")
+        self.update_btn.clicked.connect(self.update_driver)
+        self.delete_btn = QPushButton("حذف راننده")
+        self.delete_btn.clicked.connect(self.delete_driver)
+        self.clear_btn = QPushButton("پاک کردن فرم")
+        self.clear_btn.clicked.connect(self.clear_form)
+        button_v_layout.addWidget(self.add_btn)
+        button_v_layout.addWidget(self.update_btn)
+        button_v_layout.addWidget(self.delete_btn)
+        button_v_layout.addWidget(self.clear_btn)
+        form_layout.addLayout(button_v_layout)
+
+        main_layout.addWidget(form_frame)
+
+        # Table to display drivers
+        self.driver_table = QTableWidget()
+        self.driver_table.setColumnCount(10)
+        self.driver_table.setHorizontalHeaderLabels([
+            "ID", "نام", "نام خانوادگی", "کد ملی", "شماره تماس", "تاریخ استخدام", "فعال", "گواهینامه", "کارت سلامت", "آدرس"
+        ])
+        self.driver_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch) # Stretch columns
+        self.driver_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.driver_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.driver_table.doubleClicked.connect(self.load_driver_to_form)
+        main_layout.addWidget(self.driver_table)
+
+        main_layout.addWidget(self.back_to_main_button, alignment=Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+
+    def load_drivers(self):
+        """Loads all driver data into the table."""
+        drivers = self.controller.get_all_drivers()
+        self.driver_table.setRowCount(len(drivers))
+        for row, driver in enumerate(drivers):
+            self.driver_table.setItem(row, 0, QTableWidgetItem(str(driver.id)))
+            self.driver_table.setItem(row, 1, QTableWidgetItem(driver.first_name))
+            self.driver_table.setItem(row, 2, QTableWidgetItem(driver.last_name))
+            self.driver_table.setItem(row, 3, QTableWidgetItem(driver.national_code))
+            self.driver_table.setItem(row, 4, QTableWidgetItem(driver.phone_number))
+            # Convert Gregorian date from DB to Shamsi string for display
+            self.driver_table.setItem(row, 5, QTableWidgetItem(self.converter.gregorian_to_shamsi(driver.hire_date) if driver.hire_date else ""))
+            self.driver_table.setItem(row, 6, QTableWidgetItem("بله" if driver.is_active else "خیر"))
+            self.driver_table.setItem(row, 7, QTableWidgetItem(self.converter.gregorian_to_shamsi(driver.license_expiry_date) if driver.license_expiry_date else ""))
+            self.driver_table.setItem(row, 8, QTableWidgetItem(self.converter.gregorian_to_shamsi(driver.health_card_expiry_date) if driver.health_card_expiry_date else ""))
+            self.driver_table.setItem(row, 9, QTableWidgetItem(driver.address))
+
+    def clear_form(self):
+        """Clears all input fields in the form."""
+        self.id_input.clear()
+        self.first_name_input.clear()
+        self.last_name_input.clear()
+        self.national_code_input.clear()
+        self.phone_number_input.clear()
+        self.address_input.clear()
+        self.hire_date_input.setDate(QDate.currentDate()) # QDateEdit works with Gregorian
+        self.is_active_checkbox.setChecked(True)
+        self.license_expiry_date_input.setDate(QDate.currentDate().addYears(1)) # QDateEdit works with Gregorian
+        self.health_card_expiry_date_input.setDate(QDate.currentDate().addYears(1)) # QDateEdit works with Gregorian
+
+    def add_driver(self):
+        """Adds a new driver based on form input."""
+        first_name = self.first_name_input.text()
+        last_name = self.last_name_input.text()
+        national_code = self.national_code_input.text()
+        phone_number = self.phone_number_input.text()
+        address = self.address_input.text()
+        hire_date = self.hire_date_input.date().toPyDate() # Get Gregorian date from QDateEdit
+        is_active = self.is_active_checkbox.isChecked()
+        license_expiry_date = self.license_expiry_date_input.date().toPyDate() # Get Gregorian date from QDateEdit
+        health_card_expiry_date = self.health_card_expiry_date_input.date().toPyDate() # Get Gregorian date from QDateEdit
+
+        if not (first_name and last_name and national_code):
+            QMessageBox.warning(self, "خطا", "لطفاً فیلدهای نام، نام خانوادگی و کد ملی را پر کنید.")
+            return
+
+        success, message = self.controller.add_driver(
+            first_name, last_name, national_code, phone_number, address,
+            hire_date, is_active, license_expiry_date, health_card_expiry_date
+        )
+        QMessageBox.information(self, "افزودن راننده", message)
+        if success:
+            self.load_drivers()
+            self.clear_form()
+
+    def load_driver_to_form(self):
+        """Loads selected driver's data from table to form for editing."""
+        selected_row = self.driver_table.currentRow()
+        if selected_row >= 0:
+            driver_id = int(self.driver_table.item(selected_row, 0).text())
+            driver = self.controller.get_driver_by_id(driver_id)
+            if driver:
+                self.id_input.setText(str(driver.id))
+                self.first_name_input.setText(driver.first_name)
+                self.last_name_input.setText(driver.last_name)
+                self.national_code_input.setText(driver.national_code)
+                self.phone_number_input.setText(driver.phone_number)
+                self.address_input.setText(driver.address)
+                if driver.hire_date:
+                    self.hire_date_input.setDate(QDate(driver.hire_date)) # Set Gregorian date to QDateEdit
+                self.is_active_checkbox.setChecked(driver.is_active)
+                if driver.license_expiry_date:
+                    self.license_expiry_date_input.setDate(QDate(driver.license_expiry_date)) # Set Gregorian date to QDateEdit
+                if driver.health_card_expiry_date:
+                    self.health_card_expiry_date_input.setDate(QDate(driver.health_card_expiry_date)) # Set Gregorian date to QDateEdit
+
+    def update_driver(self):
+        """Updates an existing driver's information based on form input."""
+        driver_id_text = self.id_input.text()
+        if not driver_id_text:
+            QMessageBox.warning(self, "خطا", "لطفاً راننده‌ای را برای به‌روزرسانی انتخاب کنید.")
+            return
+
+        driver_id = int(driver_id_text)
+        first_name = self.first_name_input.text()
+        last_name = self.last_name_input.text()
+        national_code = self.national_code_input.text()
+        phone_number = self.phone_number_input.text()
+        address = self.address_input.text()
+        hire_date = self.hire_date_input.date().toPyDate() # Get Gregorian date from QDateEdit
+        is_active = self.is_active_checkbox.isChecked()
+        license_expiry_date = self.license_expiry_date_input.date().toPyDate() # Get Gregorian date from QDateEdit
+        health_card_expiry_date = self.health_card_expiry_date_input.date().toPyDate() # Get Gregorian date from QDateEdit
+
+        if not (first_name and last_name and national_code):
+            QMessageBox.warning(self, "خطا", "لطفاً فیلدهای نام، نام خانوادگی و کد ملی را پر کنید.")
+            return
+
+        kwargs = {
+            'first_name': first_name,
+            'last_name': last_name,
+            'national_code': national_code,
+            'phone_number': phone_number,
+            'address': address,
+            'hire_date': hire_date,
+            'is_active': is_active,
+            'license_expiry_date': license_expiry_date,
+            'health_card_expiry_date': health_card_expiry_date
+        }
+        success, message = self.controller.update_driver(driver_id, **kwargs)
+        QMessageBox.information(self, "به‌روزرسانی راننده", message)
+        if success:
+            self.load_drivers()
+            self.clear_form()
+
+    def delete_driver(self):
+        """Deletes the selected driver from the database."""
+        selected_row = self.driver_table.currentRow()
+        if selected_row < 0:
+            QMessageBox.warning(self, "خطا", "لطفاً راننده‌ای را برای حذف انتخاب کنید.")
+            return
+
+        reply = QMessageBox.question(self, "حذف راننده", "آیا مطمئن هستید که می‌خواهید این راننده را حذف کنید؟",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            driver_id = int(self.driver_table.item(selected_row, 0).text())
+            success, message = self.controller.delete_driver(driver_id)
+            QMessageBox.information(self, "حذف راننده", message)
+            if success:
+                self.load_drivers()
+                self.clear_form()
+
+class VehicleManagementWidget(BaseWidget):
+    """Widget for managing vehicle information."""
+    def __init__(self, controller):
+        super().__init__()
+        self.controller = controller
+        self.init_ui()
+        self.load_vehicles()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.addWidget(QLabel("<h2>مدیریت وسایل نقلیه</h2>", alignment=Qt.AlignmentFlag.AlignCenter))
+
+        form_frame = QFrame()
+        form_layout = QHBoxLayout(form_frame)
+
+        input_grid = QGridLayout()
+        self.id_input = QLineEdit()
+        self.id_input.setVisible(False)
+
+        input_grid.addWidget(QLabel("نوع وسیله نقلیه:"), 0, 0)
+        self.type_input = QLineEdit()
+        input_grid.addWidget(self.type_input, 0, 1)
+
+        input_grid.addWidget(QLabel("مدل:"), 1, 0)
+        self.model_input = QLineEdit()
+        input_grid.addWidget(self.model_input, 1, 1)
+
+        input_grid.addWidget(QLabel("سال ساخت:"), 2, 0)
+        self.year_input = QLineEdit()
+        input_grid.addWidget(self.year_input, 2, 1)
+
+        input_grid.addWidget(QLabel("پلاک:"), 3, 0)
+        self.plate_number_input = QLineEdit()
+        input_grid.addWidget(self.plate_number_input, 3, 1)
+
+        input_grid.addWidget(QLabel("شماره VIN:"), 4, 0)
+        self.vin_number_input = QLineEdit()
+        input_grid.addWidget(self.vin_number_input, 4, 1)
+
+        input_grid.addWidget(QLabel("وضعیت:"), 5, 0)
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(["Available", "On Mission", "In Repair"])
+        input_grid.addWidget(self.status_combo, 5, 1)
+
+        input_grid.addWidget(QLabel("تاریخ انقضای بیمه:"), 6, 0)
+        self.insurance_expiry_date_input = QDateEdit(calendarPopup=True)
+        self.insurance_expiry_date_input.setDate(QDate.currentDate().addYears(1))
+        input_grid.addWidget(self.insurance_expiry_date_input, 6, 1)
+
+        input_grid.addWidget(QLabel("تاریخ انقضای معاینه فنی:"), 7, 0)
+        self.inspection_expiry_date_input = QDateEdit(calendarPopup=True)
+        self.inspection_expiry_date_input.setDate(QDate.currentDate().addYears(1))
+        input_grid.addWidget(self.inspection_expiry_date_input, 7, 1)
+
+        input_grid.addWidget(QLabel("مصرف سوخت (لیتر/۱۰۰ کیلومتر):"), 8, 0)
+        self.fuel_consumption_input = QLineEdit()
+        input_grid.addWidget(self.fuel_consumption_input, 8, 1)
+
+        input_grid.addWidget(QLabel("تاریخ آخرین سرویس:"), 9, 0)
+        self.last_service_date_input = QDateEdit(calendarPopup=True)
+        self.last_service_date_input.setDate(QDate.currentDate())
+        input_grid.addWidget(self.last_service_date_input, 9, 1)
+
+        form_layout.addLayout(input_grid)
+
+        button_v_layout = QVBoxLayout()
+        button_v_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.add_btn = QPushButton("افزودن وسیله نقلیه")
+        self.add_btn.clicked.connect(self.add_vehicle)
+        self.update_btn = QPushButton("به‌روزرسانی وسیله نقلیه")
+        self.update_btn.clicked.connect(self.update_vehicle)
+        self.delete_btn = QPushButton("حذف وسیله نقلیه")
+        self.delete_btn.clicked.connect(self.delete_vehicle)
+        self.clear_btn = QPushButton("پاک کردن فرم")
+        self.clear_btn.clicked.connect(self.clear_form)
+
+        button_v_layout.addWidget(self.add_btn)
+        button_v_layout.addWidget(self.update_btn)
+        button_v_layout.addWidget(self.delete_btn)
+        button_v_layout.addWidget(self.clear_btn)
+        form_layout.addLayout(button_v_layout)
+
+        main_layout.addWidget(form_frame)
+
+        self.vehicle_table = QTableWidget()
+        self.vehicle_table.setColumnCount(11)
+        self.vehicle_table.setHorizontalHeaderLabels([
+            "ID", "نوع", "مدل", "سال", "پلاک", "VIN", "وضعیت", "بیمه", "معاینه فنی", "مصرف سوخت", "آخرین سرویس"
+        ])
+        self.vehicle_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.vehicle_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.vehicle_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.vehicle_table.doubleClicked.connect(self.load_vehicle_to_form)
+        main_layout.addWidget(self.vehicle_table)
+
+        main_layout.addWidget(self.back_to_main_button, alignment=Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+
+    def load_vehicles(self):
+        """Loads all vehicle data into the table."""
+        vehicles = self.controller.get_all_vehicles()
+        self.vehicle_table.setRowCount(len(vehicles))
+        for row, vehicle in enumerate(vehicles):
+            self.vehicle_table.setItem(row, 0, QTableWidgetItem(str(vehicle.id)))
+            self.vehicle_table.setItem(row, 1, QTableWidgetItem(vehicle.type))
+            self.vehicle_table.setItem(row, 2, QTableWidgetItem(vehicle.model))
+            self.vehicle_table.setItem(row, 3, QTableWidgetItem(str(vehicle.year if vehicle.year else "")))
+            self.vehicle_table.setItem(row, 4, QTableWidgetItem(vehicle.plate_number))
+            self.vehicle_table.setItem(row, 5, QTableWidgetItem(vehicle.vin_number))
+            self.vehicle_table.setItem(row, 6, QTableWidgetItem(vehicle.status))
+            # Convert Gregorian date from DB to Shamsi string for display
+            self.vehicle_table.setItem(row, 7, QTableWidgetItem(self.converter.gregorian_to_shamsi(vehicle.insurance_expiry_date) if vehicle.insurance_expiry_date else ""))
+            self.vehicle_table.setItem(row, 8, QTableWidgetItem(self.converter.gregorian_to_shamsi(vehicle.inspection_expiry_date) if vehicle.inspection_expiry_date else ""))
+            self.vehicle_table.setItem(row, 9, QTableWidgetItem(str(vehicle.fuel_consumption) if vehicle.fuel_consumption is not None else ""))
+            self.vehicle_table.setItem(row, 10, QTableWidgetItem(self.converter.gregorian_to_shamsi(vehicle.last_service_date) if vehicle.last_service_date else ""))
+
+    def clear_form(self):
+        """Clears all input fields in the form."""
+        self.id_input.clear()
+        self.type_input.clear()
+        self.model_input.clear()
+        self.year_input.clear()
+        self.plate_number_input.clear()
+        self.vin_number_input.clear()
+        self.status_combo.setCurrentIndex(0)
+        self.insurance_expiry_date_input.setDate(QDate.currentDate().addYears(1)) # QDateEdit works with Gregorian
+        self.inspection_expiry_date_input.setDate(QDate.currentDate().addYears(1)) # QDateEdit works with Gregorian
+        self.fuel_consumption_input.clear()
+        self.last_service_date_input.setDate(QDate.currentDate()) # QDateEdit works with Gregorian
+
+    def add_vehicle(self):
+        """Adds a new vehicle based on form input."""
+        type = self.type_input.text()
+        model = self.model_input.text()
+        year_text = self.year_input.text()
+        year = int(year_text) if year_text and year_text.isdigit() else None
+        plate_number = self.plate_number_input.text()
+        vin_number = self.vin_number_input.text()
+        status = self.status_combo.currentText()
+        insurance_expiry_date = self.insurance_expiry_date_input.date().toPyDate() # Get Gregorian date
+        inspection_expiry_date = self.inspection_expiry_date_input.date().toPyDate() # Get Gregorian date
+        fuel_consumption_text = self.fuel_consumption_input.text()
+        fuel_consumption = float(fuel_consumption_text) if fuel_consumption_text else None
+        last_service_date = self.last_service_date_input.date().toPyDate() # Get Gregorian date
+
+        if not (type and plate_number):
+            QMessageBox.warning(self, "خطا", "لطفاً فیلدهای نوع وسیله نقلیه و پلاک را پر کنید.")
+            return
+
+        success, message = self.controller.add_vehicle(
+            type, model, year, plate_number, vin_number, status,
+            insurance_expiry_date, inspection_expiry_date, fuel_consumption, last_service_date
+        )
+        QMessageBox.information(self, "افزودن وسیله نقلیه", message)
+        if success:
+            self.load_vehicles()
+            self.clear_form()
+
+    def load_vehicle_to_form(self):
+        """Loads selected vehicle's data from table to form for editing."""
+        selected_row = self.vehicle_table.currentRow()
+        if selected_row >= 0:
+            vehicle_id = int(self.vehicle_table.item(selected_row, 0).text())
+            vehicle = self.controller.get_vehicle_by_id(vehicle_id)
+            if vehicle:
+                self.id_input.setText(str(vehicle.id))
+                self.type_input.setText(vehicle.type)
+                self.model_input.setText(vehicle.model)
+                self.year_input.setText(str(vehicle.year) if vehicle.year else "")
+                self.plate_number_input.setText(vehicle.plate_number)
+                self.vin_number_input.setText(vehicle.vin_number)
+                self.status_combo.setCurrentText(vehicle.status)
+                if vehicle.insurance_expiry_date:
+                    self.insurance_expiry_date_input.setDate(QDate(vehicle.insurance_expiry_date)) # Set Gregorian date
+                if vehicle.inspection_expiry_date:
+                    self.inspection_expiry_date_input.setDate(QDate(vehicle.inspection_expiry_date)) # Set Gregorian date
+                if vehicle.fuel_consumption is not None:
+                    self.fuel_consumption_input.setText(str(vehicle.fuel_consumption))
+                else:
+                    self.fuel_consumption_input.clear()
+                if vehicle.last_service_date:
+                    self.last_service_date_input.setDate(QDate(vehicle.last_service_date)) # Set Gregorian date
+
+    def update_vehicle(self):
+        """Updates an existing vehicle's information based on form input."""
+        vehicle_id_text = self.id_input.text()
+        if not vehicle_id_text:
+            QMessageBox.warning(self, "خطا", "لطفاً وسیله نقلیه‌ای را برای به‌روزرسانی انتخاب کنید.")
+            return
+
+        vehicle_id = int(vehicle_id_text)
+        type = self.type_input.text()
+        model = self.model_input.text()
+        year_text = self.year_input.text()
+        year = int(year_text) if year_text and year_text.isdigit() else None
+        plate_number = self.plate_number_input.text()
+        vin_number = self.vin_number_input.text()
+        status = self.status_combo.currentText()
+        insurance_expiry_date = self.insurance_expiry_date_input.date().toPyDate() # Get Gregorian date
+        inspection_expiry_date = self.inspection_expiry_date_input.date().toPyDate() # Get Gregorian date
+        fuel_consumption_text = self.fuel_consumption_input.text()
+        fuel_consumption = float(fuel_consumption_text) if fuel_consumption_text else None
+        last_service_date = self.last_service_date_input.date().toPyDate() # Get Gregorian date
+
+        if not (type and plate_number):
+            QMessageBox.warning(self, "خطا", "لطفاً فیلدهای نوع وسیله نقلیه و پلاک را پر کنید.")
+            return
+
+        kwargs = {
+            'type': type,
+            'model': model,
+            'year': year,
+            'plate_number': plate_number,
+            'vin_number': vin_number,
+            'status': status,
+            'insurance_expiry_date': insurance_expiry_date,
+            'inspection_expiry_date': inspection_expiry_date,
+            'fuel_consumption': fuel_consumption,
+            'last_service_date': last_service_date
+        }
+        success, message = self.controller.update_vehicle(vehicle_id, **kwargs)
+        QMessageBox.information(self, "به‌روزرسانی وسیله نقلیه", message)
+        if success:
+            self.load_vehicles()
+            self.clear_form()
+
+    def delete_vehicle(self):
+        """Deletes the selected vehicle from the database."""
+        selected_row = self.vehicle_table.currentRow()
+        if selected_row < 0:
+            QMessageBox.warning(self, "خطا", "لطفاً وسیله نقلیه‌ای را برای حذف انتخاب کنید.")
+            return
+
+        reply = QMessageBox.question(self, "حذف وسیله نقلیه", "آیا مطمئن هستید که می‌خواهید این وسیله نقلیه را حذف کنید؟",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            vehicle_id = int(self.vehicle_table.item(selected_row, 0).text())
+            success, message = self.controller.delete_vehicle(vehicle_id)
+            QMessageBox.information(self, "حذف وسیله نقلیه", message)
+            if success:
+                self.load_vehicles()
+                self.clear_form()
+
+class ShiftManagementWidget(BaseWidget):
+    """Widget for managing shift types and assigning shifts to drivers."""
+    def __init__(self, shift_controller, driver_controller):
+        super().__init__()
+        self.shift_controller = shift_controller
+        self.driver_controller = driver_controller
+        self.init_ui()
+        self.load_shift_types()
+        self.load_drivers_for_combo()
+        self.load_assigned_shifts()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.addWidget(QLabel("<h2>مدیریت شیفت‌ها</h2>", alignment=Qt.AlignmentFlag.AlignCenter))
+
+        # Shift Type Definition Section
+        shift_type_frame = QFrame()
+        shift_type_group_layout = QVBoxLayout(shift_type_frame)
+        shift_type_group_layout.addWidget(QLabel("<h3>تعریف انواع شیفت:</h3>"))
+
+        shift_type_form_layout = QHBoxLayout()
+        self.shift_name_input = QLineEdit()
+        self.shift_start_time_input = QLineEdit("08:00")
+        self.shift_end_time_input = QLineEdit("16:00")
+        self.add_shift_type_btn = QPushButton("افزودن نوع شیفت")
+        self.add_shift_type_btn.clicked.connect(self.add_shift_type)
+
+        shift_type_form_layout.addWidget(QLabel("نام شیفت:"))
+        shift_type_form_layout.addWidget(self.shift_name_input)
+        shift_type_form_layout.addWidget(QLabel("زمان شروع (HH:MM):"))
+        shift_type_form_layout.addWidget(self.shift_start_time_input)
+        shift_type_form_layout.addWidget(QLabel("زمان پایان (HH:MM):"))
+        shift_type_form_layout.addWidget(self.shift_end_time_input)
+        shift_type_form_layout.addWidget(self.add_shift_type_btn)
+        shift_type_group_layout.addLayout(shift_type_form_layout)
+
+        self.shift_types_table = QTableWidget()
+        self.shift_types_table.setColumnCount(3)
+        self.shift_types_table.setHorizontalHeaderLabels(["ID", "نام شیفت", "زمان"])
+        self.shift_types_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.shift_types_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.shift_types_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        shift_type_group_layout.addWidget(self.shift_types_table)
+        main_layout.addWidget(shift_type_frame)
+
+
+        # Shift Assignment Section
+        shift_assignment_frame = QFrame()
+        shift_assignment_group_layout = QVBoxLayout(shift_assignment_frame)
+        shift_assignment_group_layout.addWidget(QLabel("<h3>تخصیص شیفت به راننده:</h3>"))
+
+        assignment_form_layout = QHBoxLayout()
+        self.driver_combo = QComboBox()
+        self.shift_type_combo = QComboBox()
+        self.shift_date_input = QDateEdit(calendarPopup=True)
+        self.shift_date_input.setDate(QDate.currentDate()) # QDateEdit works with Gregorian
+        self.assign_shift_btn = QPushButton("تخصیص شیفت")
+        self.assign_shift_btn.clicked.connect(self.assign_shift)
+
+        assignment_form_layout.addWidget(QLabel("راننده:"))
+        assignment_form_layout.addWidget(self.driver_combo)
+        assignment_form_layout.addWidget(QLabel("نوع شیفت:"))
+        assignment_form_layout.addWidget(self.shift_type_combo)
+        assignment_form_layout.addWidget(QLabel("تاریخ شیفت:"))
+        assignment_form_layout.addWidget(self.shift_date_input)
+        assignment_form_layout.addWidget(self.assign_shift_btn)
+        shift_assignment_group_layout.addLayout(assignment_form_layout)
+
+        self.assigned_shifts_table = QTableWidget()
+        self.assigned_shifts_table.setColumnCount(5)
+        self.assigned_shifts_table.setHorizontalHeaderLabels(["ID", "راننده", "شیفت", "تاریخ", "زمان شیفت"])
+        self.assigned_shifts_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.assigned_shifts_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.assigned_shifts_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.delete_assigned_shift_btn = QPushButton("حذف شیفت تخصیص یافته")
+        self.delete_assigned_shift_btn.clicked.connect(self.delete_assigned_shift)
+
+        shift_assignment_group_layout.addWidget(self.assigned_shifts_table)
+        shift_assignment_group_layout.addWidget(self.delete_assigned_shift_btn)
+        main_layout.addWidget(shift_assignment_frame)
+
+        main_layout.addWidget(self.back_to_main_button, alignment=Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+
+    def load_shift_types(self):
+        """Loads all defined shift types into the table and combo box."""
+        shift_types = self.shift_controller.get_all_shift_types()
+        self.shift_types_table.setRowCount(len(shift_types))
+        self.shift_type_combo.clear()
+        for row, shift_type in enumerate(shift_types):
+            self.shift_types_table.setItem(row, 0, QTableWidgetItem(str(shift_type.id)))
+            self.shift_types_table.setItem(row, 1, QTableWidgetItem(shift_type.name))
+            self.shift_types_table.setItem(row, 2, QTableWidgetItem(f"{shift_type.start_time} - {shift_type.end_time}"))
+            self.shift_type_combo.addItem(shift_type.name, shift_type.id)
+
+    def add_shift_type(self):
+        """Adds a new shift type based on form input."""
+        name = self.shift_name_input.text()
+        start_time = self.shift_start_time_input.text()
+        end_time = self.shift_end_time_input.text()
+
+        if not (name and start_time and end_time):
+            QMessageBox.warning(self, "خطا", "لطفاً تمام فیلدهای نوع شیفت را پر کنید.")
+            return
+
+        success, message = self.shift_controller.add_shift_type(name, start_time, end_time)
+        QMessageBox.information(self, "افزودن نوع شیفت", message)
+        if success:
+            self.load_shift_types()
+            self.shift_name_input.clear()
+            self.shift_start_time_input.setText("08:00")
+            self.shift_end_time_input.setText("16:00")
+
+    def load_drivers_for_combo(self):
+        """Loads all drivers into the driver combo box."""
+        drivers = self.driver_controller.get_all_drivers()
+        self.driver_combo.clear()
+        for driver in drivers:
+            self.driver_combo.addItem(f"{driver.first_name} {driver.last_name}", driver.id)
+
+    def assign_shift(self):
+        """Assigns a selected shift type to a driver on a specific date."""
+        selected_driver_id = self.driver_combo.currentData()
+        selected_shift_id = self.shift_type_combo.currentData()
+        shift_date = self.shift_date_input.date().toPyDate() # Get Gregorian date
+
+        if not selected_driver_id or not selected_shift_id:
+            QMessageBox.warning(self, "خطا", "لطفاً راننده و نوع شیفت را انتخاب کنید.")
+            return
+
+        success, message = self.shift_controller.assign_shift_to_driver(selected_driver_id, selected_shift_id, shift_date)
+        QMessageBox.information(self, "تخصیص شیفت", message)
+        if success:
+            self.load_assigned_shifts()
+
+    def load_assigned_shifts(self):
+        """Loads all assigned shifts into the table."""
+        assigned_shifts = self.shift_controller.get_driver_shifts()
+        self.assigned_shifts_table.setRowCount(len(assigned_shifts))
+        for row, assignment in enumerate(assigned_shifts):
+            self.assigned_shifts_table.setItem(row, 0, QTableWidgetItem(str(assignment.id)))
+            self.assigned_shifts_table.setItem(row, 1, QTableWidgetItem(f"{assignment.driver.first_name} {assignment.driver.last_name}"))
+            self.assigned_shifts_table.setItem(row, 2, QTableWidgetItem(assignment.shift.name))
+            # Convert Gregorian date from DB to Shamsi string for display
+            self.assigned_shifts_table.setItem(row, 3, QTableWidgetItem(self.converter.gregorian_to_shamsi(assignment.shift_date)))
+            self.assigned_shifts_table.setItem(row, 4, QTableWidgetItem(f"{assignment.shift.start_time} - {assignment.shift.end_time}"))
+
+class MissionManagementWidget(BaseWidget):
+    """Widget for managing mission creation, tracking, and completion."""
+    def __init__(self, controller, driver_controller, vehicle_controller):
+        super().__init__()
+        self.controller = controller
+        self.driver_controller = driver_controller
+        self.vehicle_controller = vehicle_controller
+        self.init_ui()
+        self.load_drivers_for_combo()
+        self.load_vehicles_for_combo()
+        self.load_missions()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.addWidget(QLabel("<h2>مدیریت ماموریت‌ها</h2>", alignment=Qt.AlignmentFlag.AlignCenter))
+
+        form_frame = QFrame()
+        form_layout = QHBoxLayout(form_frame)
+
+        input_grid = QGridLayout()
+        self.id_input = QLineEdit()
+        self.id_input.setVisible(False)
+
+        input_grid.addWidget(QLabel("راننده:"), 0, 0)
+        self.driver_combo = QComboBox()
+        input_grid.addWidget(self.driver_combo, 0, 1)
+
+        input_grid.addWidget(QLabel("وسیله نقلیه:"), 1, 0)
+        self.vehicle_combo = QComboBox()
+        input_grid.addWidget(self.vehicle_combo, 1, 1)
+
+        input_grid.addWidget(QLabel("تاریخ و زمان شروع:"), 2, 0)
+        self.start_date_time_input = QDateTimeEdit(calendarPopup=True)
+        self.start_date_time_input.setDateTime(QDateTime.currentDateTime()) # QDateTimeEdit works with Gregorian
+        input_grid.addWidget(self.start_date_time_input, 2, 1)
+
+        input_grid.addWidget(QLabel("تاریخ و زمان پایان (پیش‌بینی شده):"), 3, 0)
+        self.end_date_time_predicted_input = QDateTimeEdit(calendarPopup=True)
+        self.end_date_time_predicted_input.setDateTime(QDateTime.currentDateTime().addDays(1)) # QDateTimeEdit works with Gregorian
+        input_grid.addWidget(self.end_date_time_predicted_input, 3, 1)
+
+        input_grid.addWidget(QLabel("مبدأ:"), 4, 0)
+        self.origin_input = QLineEdit()
+        input_grid.addWidget(self.origin_input, 4, 1)
+
+        input_grid.addWidget(QLabel("مقصد:"), 5, 0)
+        self.destination_input = QLineEdit()
+        input_grid.addWidget(self.destination_input, 5, 1)
+
+        input_grid.addWidget(QLabel("بار/موضوع ماموریت:"), 6, 0)
+        self.cargo_description_input = QTextEdit()
+        input_grid.addWidget(self.cargo_description_input, 6, 1)
+
+        input_grid.addWidget(QLabel("گیرنده/فرستنده:"), 7, 0)
+        self.recipient_sender_input = QLineEdit()
+        input_grid.addWidget(self.recipient_sender_input, 7, 1)
+
+        input_grid.addWidget(QLabel("وضعیت ماموریت:"), 8, 0)
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(["Pending", "In Progress", "Completed", "Canceled"])
+        self.status_combo.currentIndexChanged.connect(self.toggle_completion_fields)
+        input_grid.addWidget(self.status_combo, 8, 1)
+
+        input_grid.addWidget(QLabel("تاریخ و زمان پایان (واقعی):"), 9, 0)
+        self.end_date_time_actual_input = QDateTimeEdit(calendarPopup=True)
+        self.end_date_time_actual_input.setDateTime(QDateTime.currentDateTime()) # QDateTimeEdit works with Gregorian
+        self.end_date_time_actual_input.setEnabled(False)
+        input_grid.addWidget(self.end_date_time_actual_input, 9, 1)
+
+        input_grid.addWidget(QLabel("هزینه سوخت:"), 10, 0)
+        self.fuel_cost_input = QLineEdit()
+        self.fuel_cost_input.setEnabled(False)
+        input_grid.addWidget(self.fuel_cost_input, 10, 1)
+
+        input_grid.addWidget(QLabel("عوارض:"), 11, 0)
+        self.toll_fees_input = QLineEdit()
+        self.toll_fees_input.setEnabled(False)
+        input_grid.addWidget(self.toll_fees_input, 11, 1)
+
+        input_grid.addWidget(QLabel("هزینه‌های تعمیرات جزئی:"), 12, 0)
+        self.minor_repairs_cost_input = QLineEdit()
+        self.minor_repairs_cost_input.setEnabled(False)
+        input_grid.addWidget(self.minor_repairs_cost_input, 12, 1)
+
+        form_layout.addLayout(input_grid)
+        main_layout.addWidget(form_frame)
+
+        button_layout = QHBoxLayout()
+        self.add_btn = QPushButton("ثبت ماموریت")
+        self.add_btn.clicked.connect(self.add_mission)
+        self.update_btn = QPushButton("به‌روزرسانی ماموریت")
+        self.update_btn.clicked.connect(self.update_mission)
+        self.delete_btn = QPushButton("حذف ماموریت")
+        self.delete_btn.clicked.connect(self.delete_mission)
+        self.clear_btn = QPushButton("پاک کردن فرم")
+        self.clear_btn.clicked.connect(self.clear_form)
+
+        button_layout.addWidget(self.add_btn)
+        button_layout.addWidget(self.update_btn)
+        button_layout.addWidget(self.delete_btn)
+        button_layout.addWidget(self.clear_btn)
+        main_layout.addLayout(button_layout)
+
+        self.mission_table = QTableWidget()
+        self.mission_table.setColumnCount(14)
+        self.mission_table.setHorizontalHeaderLabels([
+            "ID", "راننده", "وسیله نقلیه", "شروع", "پایان (پیش‌بینی)", "پایان (واقعی)",
+            "مبدأ", "مقصد", "بار", "گیرنده/فرستنده", "وضعیت", "هزینه سوخت", "عوارض", "تعمیرات جزئی"
+        ])
+        self.mission_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.mission_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.mission_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.mission_table.doubleClicked.connect(self.load_mission_to_form)
+        main_layout.addWidget(self.mission_table)
+
+        main_layout.addWidget(self.back_to_main_button, alignment=Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+
+    def toggle_completion_fields(self):
+        """Enables/disables mission completion fields based on status."""
+        is_completed = self.status_combo.currentText() == "Completed"
+        self.end_date_time_actual_input.setEnabled(is_completed)
+        self.fuel_cost_input.setEnabled(is_completed)
+        self.toll_fees_input.setEnabled(is_completed)
+        self.minor_repairs_cost_input.setEnabled(is_completed)
+
+    def load_drivers_for_combo(self):
+        """Loads drivers into the driver combo box."""
+        drivers = self.driver_controller.get_all_drivers()
+        self.driver_combo.clear()
+        for driver in drivers:
+            self.driver_combo.addItem(f"{driver.first_name} {driver.last_name}", driver.id)
+
+    def load_vehicles_for_combo(self):
+        """Loads vehicles into the vehicle combo box."""
+        vehicles = self.vehicle_controller.get_all_vehicles()
+        self.vehicle_combo.clear()
+        for vehicle in vehicles:
+            self.vehicle_combo.addItem(f"{vehicle.plate_number} ({vehicle.type})", vehicle.id)
+
+    def load_missions(self):
+        """Loads all missions into the table."""
+        missions = self.controller.get_all_missions()
+        self.mission_table.setRowCount(len(missions))
+        for row, mission in enumerate(missions):
+            self.mission_table.setItem(row, 0, QTableWidgetItem(str(mission.id)))
+            self.mission_table.setItem(row, 1, QTableWidgetItem(f"{mission.driver.first_name} {mission.driver.last_name}"))
+            self.mission_table.setItem(row, 2, QTableWidgetItem(mission.vehicle.plate_number))
+            # Convert Gregorian datetime string from DB to Shamsi string for display
+            self.mission_table.setItem(row, 3, QTableWidgetItem(self.converter.qdatetime_to_shamsi_str(self.converter.shamsi_str_to_qdatetime(mission.start_date_time))))
+            self.mission_table.setItem(row, 4, QTableWidgetItem(self.converter.qdatetime_to_shamsi_str(self.converter.shamsi_str_to_qdatetime(mission.end_date_time_predicted)) if mission.end_date_time_predicted else ""))
+            self.mission_table.setItem(row, 5, QTableWidgetItem(self.converter.qdatetime_to_shamsi_str(self.converter.shamsi_str_to_qdatetime(mission.end_date_time_actual)) if mission.end_date_time_actual else ""))
+            self.mission_table.setItem(row, 6, QTableWidgetItem(mission.origin))
+            self.mission_table.setItem(row, 7, QTableWidgetItem(mission.destination))
+            self.mission_table.setItem(row, 8, QTableWidgetItem(mission.cargo_description or ""))
+            self.mission_table.setItem(row, 9, QTableWidgetItem(mission.recipient_sender or ""))
+            self.mission_table.setItem(row, 10, QTableWidgetItem(mission.status))
+            self.mission_table.setItem(row, 11, QTableWidgetItem(str(mission.fuel_cost) if mission.fuel_cost is not None else ""))
+            self.mission_table.setItem(row, 12, QTableWidgetItem(str(mission.toll_fees) if mission.toll_fees is not None else ""))
+            self.mission_table.setItem(row, 13, QTableWidgetItem(str(mission.minor_repairs_cost) if mission.minor_repairs_cost is not None else ""))
+
+    def clear_form(self):
+        """Clears all input fields in the form."""
+        self.id_input.clear()
+        self.driver_combo.setCurrentIndex(0)
+        self.vehicle_combo.setCurrentIndex(0)
+        self.start_date_time_input.setDateTime(QDateTime.currentDateTime()) # QDateTimeEdit works with Gregorian
+        self.end_date_time_predicted_input.setDateTime(QDateTime.currentDateTime().addDays(1)) # QDateTimeEdit works with Gregorian
+        self.origin_input.clear()
+        self.destination_input.clear()
+        self.cargo_description_input.clear()
+        self.recipient_sender_input.clear()
+        self.status_combo.setCurrentIndex(0)
+        self.end_date_time_actual_input.setDateTime(QDateTime.currentDateTime()) # QDateTimeEdit works with Gregorian
+        self.fuel_cost_input.clear()
+        self.toll_fees_input.clear()
+        self.minor_repairs_cost_input.clear()
+        self.toggle_completion_fields() # Reset enabled/disabled states
+
+    def add_mission(self):
+        """Adds a new mission based on form input."""
+        driver_id = self.driver_combo.currentData()
+        vehicle_id = self.vehicle_combo.currentData()
+        # Get Gregorian datetime string from QDateTimeEdit for DB storage
+        start_date_time = self.start_date_time_input.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        end_date_time_predicted = self.end_date_time_predicted_input.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        origin = self.origin_input.text()
+        destination = self.destination_input.text()
+        cargo_description = self.cargo_description_input.toPlainText()
+        recipient_sender = self.recipient_sender_input.text()
+
+        if not (driver_id and vehicle_id and origin and destination):
+            QMessageBox.warning(self, "خطا", "لطفاً تمام فیلدهای الزامی (راننده، وسیله نقلیه، مبدأ، مقصد) را پر کنید.")
+            return
+
+        success, message = self.controller.add_mission(
+            driver_id, vehicle_id, start_date_time, end_date_time_predicted,
+            origin, destination, cargo_description, recipient_sender
+        )
+        QMessageBox.information(self, "ثبت ماموریت", message)
+        if success:
+            self.load_missions()
+            self.clear_form()
+
+    def load_mission_to_form(self):
+        """Loads selected mission's data from table to form for editing."""
+        selected_row = self.mission_table.currentRow()
+        if selected_row >= 0:
+            mission_id = int(self.mission_table.item(selected_row, 0).text())
+            mission = self.controller.get_mission_by_id(mission_id)
+            if mission:
+                self.id_input.setText(str(mission.id))
+                # Set combo box text by finding the matching data (ID)
+                driver_index = self.driver_combo.findData(mission.driver_id)
+                if driver_index != -1: self.driver_combo.setCurrentIndex(driver_index)
+                vehicle_index = self.vehicle_combo.findData(mission.vehicle_id)
+                if vehicle_index != -1: self.vehicle_combo.setCurrentIndex(vehicle_index)
+
+                # Set Gregorian datetime to QDateTimeEdit
+                self.start_date_time_input.setDateTime(QDateTime.fromString(mission.start_date_time, "yyyy-MM-dd HH:mm:ss"))
+                if mission.end_date_time_predicted:
+                    self.end_date_time_predicted_input.setDateTime(QDateTime.fromString(mission.end_date_time_predicted, "yyyy-MM-dd HH:mm:ss"))
+                self.origin_input.setText(mission.origin)
+                self.destination_input.setText(mission.destination)
+                self.cargo_description_input.setText(mission.cargo_description)
+                self.recipient_sender_input.setText(mission.recipient_sender)
+                self.status_combo.setCurrentText(mission.status)
+
+                if mission.end_date_time_actual:
+                    self.end_date_time_actual_input.setDateTime(QDateTime.fromString(mission.end_date_time_actual, "yyyy-MM-dd HH:mm:ss"))
+                else:
+                    self.end_date_time_actual_input.setDateTime(QDateTime.currentDateTime())
+
+                self.fuel_cost_input.setText(str(mission.fuel_cost) if mission.fuel_cost is not None else "")
+                self.toll_fees_input.setText(str(mission.toll_fees) if mission.toll_fees is not None else "")
+                self.minor_repairs_cost_input.setText(str(mission.minor_repairs_cost) if mission.minor_repairs_cost is not None else "")
+
+                self.toggle_completion_fields()
+
+    def update_mission(self):
+        """Updates an existing mission's status and details."""
+        mission_id_text = self.id_input.text()
+        if not mission_id_text:
+            QMessageBox.warning(self, "خطا", "لطفاً ماموریتی را برای به‌روزرسانی انتخاب کنید.")
+            return
+
+        mission_id = int(mission_id_text)
+        new_status = self.status_combo.currentText()
+        actual_end_time = None
+        fuel_cost = None
+        toll_fees = None
+        minor_repairs_cost = None
+
+        if new_status == "Completed":
+            # Get Gregorian datetime string from QDateTimeEdit for DB storage
+            actual_end_time = self.end_date_time_actual_input.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+            try:
+                fuel_cost = float(self.fuel_cost_input.text()) if self.fuel_cost_input.text() else None
+                toll_fees = float(self.toll_fees_input.text()) if self.toll_fees_input.text() else None
+                minor_repairs_cost = float(self.minor_repairs_cost_input.text()) if self.minor_repairs_cost_input.text() else None
+            except ValueError:
+                QMessageBox.warning(self, "خطا", "هزینه‌ها باید اعداد معتبر باشند.")
+                return
+
+        success, message = self.controller.update_mission_status(
+            mission_id, new_status, actual_end_time, fuel_cost, toll_fees, minor_repairs_cost
+        )
+        QMessageBox.information(self, "به‌روزرسانی ماموریت", message)
+        if success:
+            self.load_missions()
+            self.clear_form()
+
+    def delete_mission(self):
+        """Deletes the selected mission."""
+        selected_row = self.mission_table.currentRow()
+        if selected_row < 0:
+            QMessageBox.warning(self, "خطا", "لطفاً ماموریتی را برای حذف انتخاب کنید.")
+            return
+
+        reply = QMessageBox.question(self, "حذف ماموریت", "آیا مطمئن هستید که می‌خواهید این ماموریت را حذف کنید؟",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            mission_id = int(self.mission_table.item(selected_row, 0).text())
+            success, message = self.controller.delete_mission(mission_id)
+            QMessageBox.information(self, "حذف ماموریت", message)
+            if success:
+                self.load_missions()
+                self.clear_form()
+
+class DashboardWidget(BaseWidget):
+    """Widget for displaying key performance indicators and charts."""
+    def __init__(self, driver_controller, vehicle_controller, mission_controller):
+        super().__init__()
+        self.driver_controller = driver_controller
+        self.vehicle_controller = vehicle_controller
+        self.mission_controller = mission_controller
+        self.init_ui()
+        self.refresh_dashboard()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.addWidget(QLabel("<h2>داشبورد جامع</h2>", alignment=Qt.AlignmentFlag.AlignCenter))
+
+        # KPI section
+        kpi_layout = QGridLayout()
+        main_layout.addLayout(kpi_layout)
+
+        self.drivers_kpi = self._create_kpi_card("رانندگان فعال:", "0", "#007bff")
+        self.vehicles_available_kpi = self._create_kpi_card("وسایل نقلیه در دسترس:", "0", "#28a745")
+        self.missions_in_progress_kpi = self._create_kpi_card("ماموریت‌های در حال انجام:", "0", "#ffc107")
+        self.missions_pending_kpi = self._create_kpi_card("ماموریت‌های در انتظار:", "0", "#17a2b8")
+        self.missions_completed_kpi = self._create_kpi_card("ماموریت‌های تکمیل شده:", "0", "#6f42c1")
+
+        kpi_layout.addWidget(self.drivers_kpi[0], 0, 0)
+        kpi_layout.addWidget(self.vehicles_available_kpi[0], 0, 1)
+        kpi_layout.addWidget(self.missions_in_progress_kpi[0], 0, 2)
+        kpi_layout.addWidget(self.missions_pending_kpi[0], 1, 0)
+        kpi_layout.addWidget(self.missions_completed_kpi[0], 1, 1)
+
+        # Charts section
+        charts_layout = QHBoxLayout()
+        main_layout.addLayout(charts_layout)
+
+        # Matplotlib chart for vehicle status
+        self.vehicle_status_figure, self.vehicle_status_ax = plt.subplots(figsize=(4, 4))
+        self.vehicle_status_canvas = FigureCanvas(self.vehicle_status_figure)
+        self.vehicle_status_chart_frame = self._create_chart_frame("وضعیت وسایل نقلیه")
+        self.vehicle_status_chart_frame.layout().addWidget(self.vehicle_status_canvas)
+        charts_layout.addWidget(self.vehicle_status_chart_frame)
+
+        # Matplotlib chart for mission status
+        self.mission_status_figure, self.mission_status_ax = plt.subplots(figsize=(4, 4))
+        self.mission_status_canvas = FigureCanvas(self.mission_status_figure)
+        self.mission_status_chart_frame = self._create_chart_frame("وضعیت ماموریت‌ها")
+        self.mission_status_chart_frame.layout().addWidget(self.mission_status_canvas)
+        charts_layout.addWidget(self.mission_status_chart_frame)
+
+        # Alerts/Upcoming events section
+        alert_frame = QFrame()
+        alert_layout = QVBoxLayout(alert_frame)
+        alert_layout.addWidget(QLabel("<h3>هشدارها و رویدادهای آتی:</h3>"))
+        self.alerts_label = QLabel("هیچ هشداری وجود ندارد.")
+        self.alerts_label.setStyleSheet("color: #dc3545; font-weight: bold; font-size: 16px;")
+        alert_layout.addWidget(self.alerts_label)
+        main_layout.addWidget(alert_frame)
+
+        main_layout.addWidget(self.back_to_main_button, alignment=Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+
+    def _create_kpi_card(self, title, value, color):
+        """Creates a KPI card widget."""
+        frame = QFrame()
+        frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {color};
+                color: white;
+                border-radius: 12px;
+                padding: 15px;
+                margin: 5px;
+                box-shadow: 3px 3px 8px rgba(0, 0, 0, 0.2);
+            }}
+            QLabel {{
+                color: white;
+            }}
+        """)
+        layout = QVBoxLayout(frame)
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        value_label = QLabel(value)
+        value_label.setStyleSheet("font-size: 28px; font-weight: bold;")
+        layout.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(value_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        return frame, value_label
+
+    def _create_chart_frame(self, title):
+        """Creates a frame for a chart with a title."""
+        frame = QFrame()
+        layout = QVBoxLayout(frame)
+        chart_title = QLabel(f"<h3>{title}</h3>")
+        chart_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(chart_title)
+        return frame
+
+    def refresh_dashboard(self):
+        """Refreshes all data and charts on the dashboard."""
+        # Update KPIs
+        drivers = self.driver_controller.get_all_drivers()
+        active_drivers = len([d for d in drivers if d.is_active])
+        self.drivers_kpi[1].setText(str(active_drivers))
+
+        vehicles = self.vehicle_controller.get_all_vehicles()
+        available_vehicles = len([v for v in vehicles if v.status == 'Available'])
+        self.vehicles_available_kpi[1].setText(str(available_vehicles))
+
+        missions = self.mission_controller.get_all_missions()
+        in_progress_missions = len([m for m in missions if m.status == 'In Progress'])
+        pending_missions = len([m for m in missions if m.status == 'Pending'])
+        completed_missions = len([m for m in missions if m.status == 'Completed'])
+
+        self.missions_in_progress_kpi[1].setText(str(in_progress_missions))
+        self.missions_pending_kpi[1].setText(str(pending_missions))
+        self.missions_completed_kpi[1].setText(str(completed_missions))
+
+        # Update Charts
+        self._update_vehicle_status_chart(vehicles)
+        self._update_mission_status_chart(missions)
+
+        # Update Alerts
+        self._check_alerts(drivers, vehicles)
+
+    def _update_vehicle_status_chart(self, vehicles):
+        """Updates the pie chart for vehicle status."""
+        status_counts = {}
+        for vehicle in vehicles:
+            status_counts[vehicle.status] = status_counts.get(vehicle.status, 0) + 1
+
+        labels = list(status_counts.keys())
+        sizes = list(status_counts.values())
+
+        self.vehicle_status_ax.clear()
+        if not sizes:
+            self.vehicle_status_ax.text(0.5, 0.5, 'داده‌ای نیست', horizontalalignment='center', verticalalignment='center', transform=self.vehicle_status_ax.transAxes, fontproperties={'family':'Arial Unicode MS'})
+        else:
+            self.vehicle_status_ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90, colors=plt.cm.Paired.colors, textprops={'fontproperties': 'Arial Unicode MS'})
+        self.vehicle_status_ax.axis('equal') # Equal aspect ratio ensures that pie is drawn as a circle.
+        self.vehicle_status_figure.tight_layout()
+        self.vehicle_status_canvas.draw()
+
+    def _update_mission_status_chart(self, missions):
+        """Updates the pie chart for mission status."""
+        status_counts = {}
+        for mission in missions:
+            status_counts[mission.status] = status_counts.get(mission.status, 0) + 1
+
+        labels = list(status_counts.keys())
+        sizes = list(status_counts.values())
+
+        self.mission_status_ax.clear()
+        if not sizes:
+            self.mission_status_ax.text(0.5, 0.5, 'داده‌ای نیست', horizontalalignment='center', verticalalignment='center', transform=self.mission_status_ax.transAxes, fontproperties={'family':'Arial Unicode MS'})
+        else:
+            self.mission_status_ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90, colors=plt.cm.Set3.colors, textprops={'fontproperties': 'Arial Unicode MS'})
+        self.mission_status_ax.axis('equal') # Equal aspect ratio ensures that pie is drawn as a circle.
+        self.mission_status_figure.tight_layout()
+        self.mission_status_canvas.draw()
+
+    def _check_alerts(self, drivers, vehicles):
+        """Checks for upcoming expiry dates and displays alerts."""
+        alerts = []
+        today = date.today()
+
+        for driver in drivers:
+            if driver.license_expiry_date and driver.license_expiry_date < today + timedelta(days=60) and driver.license_expiry_date >= today:
+                alerts.append(f"تاریخ انقضای گواهینامه راننده {driver.first_name} {driver.last_name} نزدیک است: {self.converter.gregorian_to_shamsi(driver.license_expiry_date)}")
+            if driver.health_card_expiry_date and driver.health_card_expiry_date < today + timedelta(days=60) and driver.health_card_expiry_date >= today:
+                alerts.append(f"تاریخ انقضای کارت سلامت راننده {driver.first_name} {driver.last_name} نزدیک است: {self.converter.gregorian_to_shamsi(driver.health_card_expiry_date)}")
+
+        for vehicle in vehicles:
+            if vehicle.insurance_expiry_date and vehicle.insurance_expiry_date < today + timedelta(days=60) and vehicle.insurance_expiry_date >= today:
+                alerts.append(f"تاریخ انقضای بیمه وسیله نقلیه {vehicle.plate_number} نزدیک است: {self.converter.gregorian_to_shamsi(vehicle.insurance_expiry_date)}")
+            if vehicle.inspection_expiry_date and vehicle.inspection_expiry_date < today + timedelta(days=60) and vehicle.inspection_expiry_date >= today:
+                alerts.append(f"تاریخ انقضای معاینه فنی وسیله نقلیه {vehicle.plate_number} نزدیک است: {self.converter.gregorian_to_shamsi(vehicle.inspection_expiry_date)}")
+
+        if alerts:
+            self.alerts_label.setText("\n".join(alerts))
+        else:
+            self.alerts_label.setText("هیچ هشداری وجود ندارد.")
+
+class ReportsWidget(BaseWidget):
+    """Widget for generating and exporting various reports."""
+    def __init__(self, driver_controller, vehicle_controller, mission_controller):
+        super().__init__()
+        self.driver_controller = driver_controller
+        self.vehicle_controller = vehicle_controller
+        self.mission_controller = mission_controller
+        self.init_ui()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.addWidget(QLabel("<h2>گزارش‌گیری</h2>", alignment=Qt.AlignmentFlag.AlignCenter))
+
+        filter_frame = QFrame()
+        filter_layout = QHBoxLayout(filter_frame)
+
+        filter_layout.addWidget(QLabel("نوع گزارش:"))
+        self.report_type_combo = QComboBox()
+        self.report_type_combo.addItems([
+            "عملکرد رانندگان",
+            "وضعیت وسایل نقلیه",
+            "ماموریت‌ها بر اساس تاریخ",
+            "هزینه‌های ماموریت"
+        ])
+        filter_layout.addWidget(self.report_type_combo)
+
+        filter_layout.addWidget(QLabel("از تاریخ:"))
+        self.start_date_filter = QDateEdit(calendarPopup=True)
+        self.start_date_filter.setDate(QDate.currentDate().addMonths(-1)) # QDateEdit works with Gregorian
+        filter_layout.addWidget(self.start_date_filter)
+
+        filter_layout.addWidget(QLabel("تا تاریخ:"))
+        self.end_date_filter = QDateEdit(calendarPopup=True)
+        self.end_date_filter.setDate(QDate.currentDate()) # QDateEdit works with Gregorian
+        filter_layout.addWidget(self.end_date_filter)
+
+        self.generate_report_btn = QPushButton("تولید گزارش")
+        self.generate_report_btn.clicked.connect(self.generate_report)
+        filter_layout.addWidget(self.generate_report_btn)
+        main_layout.addWidget(filter_frame)
+
+        self.report_table = QTableWidget()
+        self.report_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        main_layout.addWidget(self.report_table)
+
+        export_layout = QHBoxLayout()
+        self.export_excel_btn = QPushButton("خروجی اکسل")
+        self.export_excel_btn.clicked.connect(self.export_to_excel)
+        export_layout.addWidget(self.export_excel_btn)
+
+        self.export_pdf_btn = QPushButton("خروجی PDF")
+        self.export_pdf_btn.clicked.connect(self.export_to_pdf)
+        export_layout.addWidget(self.export_pdf_btn)
+        main_layout.addLayout(export_layout)
+
+        main_layout.addWidget(self.back_to_main_button, alignment=Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft)
+
+    def generate_report(self):
+        """Generates report data based on selected type and date range."""
+        report_type = self.report_type_combo.currentText()
+        start_date_greg = self.start_date_filter.date().toPyDate() # Get Gregorian date
+        end_date_greg = self.end_date_filter.date().toPyDate() # Get Gregorian date
+
+        data = []
+        headers = []
+
+        if report_type == "عملکرد رانندگان":
+            drivers = self.driver_controller.get_all_drivers()
+            headers = ["نام راننده", "تعداد ماموریت", "کل مصرف سوخت (لیتر)", "مجموع عوارض", "مجموع تعمیرات جزئی"]
+            for driver in drivers:
+                missions = [m for m in self.mission_controller.get_all_missions() if m.driver_id == driver.id and m.status == "Completed"]
+                total_missions = len(missions)
+                total_fuel_cost = sum(m.fuel_cost for m in missions if m.fuel_cost is not None)
+                total_toll_fees = sum(m.toll_fees for m in missions if m.toll_fees is not None)
+                total_minor_repairs = sum(m.minor_repairs_cost for m in missions if m.minor_repairs_cost is not None)
+                data.append([f"{driver.first_name} {driver.last_name}", total_missions, total_fuel_cost, total_toll_fees, total_minor_repairs])
+
+        elif report_type == "وضعیت وسایل نقلیه":
+            vehicles = self.vehicle_controller.get_all_vehicles()
+            headers = ["پلاک", "نوع", "مدل", "وضعیت", "تاریخ آخرین سرویس", "تاریخ انقضای بیمه", "تاریخ انقضای معاینه فنی"]
+            for vehicle in vehicles:
+                data.append([
+                    vehicle.plate_number, vehicle.type, vehicle.model, vehicle.status,
+                    self.converter.gregorian_to_shamsi(vehicle.last_service_date) if vehicle.last_service_date else "",
+                    self.converter.gregorian_to_shamsi(vehicle.insurance_expiry_date) if vehicle.insurance_expiry_date else "",
+                    self.converter.gregorian_to_shamsi(vehicle.inspection_expiry_date) if vehicle.inspection_expiry_date else ""
+                ])
+
+        elif report_type == "ماموریت‌ها بر اساس تاریخ":
+            missions = self.mission_controller.get_all_missions()
+            filtered_missions = []
+            for m in missions:
+                if m.start_date_time:
+                    # Convert stored Gregorian string to QDateTime, then to Gregorian date object for comparison
+                    mission_start_date_greg = QDateTime.fromString(m.start_date_time, "yyyy-MM-dd HH:mm:ss").date().toPyDate()
+                    if start_date_greg <= mission_start_date_greg <= end_date_greg:
+                        filtered_missions.append(m)
+
+            headers = ["ID", "راننده", "وسیله نقلیه", "شروع", "پایان واقعی", "مبدأ", "مقصد", "وضعیت"]
+            for mission in filtered_missions:
+                data.append([
+                    str(mission.id),
+                    f"{mission.driver.first_name} {mission.driver.last_name}",
+                    mission.vehicle.plate_number,
+                    self.converter.qdatetime_to_shamsi_str(self.converter.shamsi_str_to_qdatetime(mission.start_date_time)),
+                    self.converter.qdatetime_to_shamsi_str(self.converter.shamsi_str_to_qdatetime(mission.end_date_time_actual)) if mission.end_date_time_actual else "",
+                    mission.origin,
+                    mission.destination,
+                    mission.status
+                ])
+
+        elif report_type == "هزینه‌های ماموریت":
+            missions = self.mission_controller.get_all_missions()
+            filtered_missions = []
+            for m in missions:
+                if m.status == "Completed" and m.end_date_time_actual:
+                    # Convert stored Gregorian string to QDateTime, then to Gregorian date object for comparison
+                    mission_end_date_greg = QDateTime.fromString(m.end_date_time_actual, "yyyy-MM-dd HH:mm:ss").date().toPyDate()
+                    if start_date_greg <= mission_end_date_greg <= end_date_greg:
+                        filtered_missions.append(m)
+
+            headers = ["ID ماموریت", "راننده", "وسیله نقلیه", "تاریخ پایان", "هزینه سوخت", "عوارض", "تعمیرات جزئی", "مجموع هزینه"]
+            for mission in filtered_missions:
+                total_cost = (mission.fuel_cost or 0) + (mission.toll_fees or 0) + (mission.minor_repairs_cost or 0)
+                data.append([
+                    str(mission.id),
+                    f"{mission.driver.first_name} {mission.driver.last_name}",
+                    mission.vehicle.plate_number,
+                    self.converter.qdatetime_to_shamsi_str(self.converter.shamsi_str_to_qdatetime(mission.end_date_time_actual)),
+                    str(mission.fuel_cost or 0),
+                    str(mission.toll_fees or 0),
+                    str(mission.minor_repairs_cost or 0),
+                    str(total_cost)
+                ])
+
+        self.display_report(headers, data)
+
+    def display_report(self, headers, data):
+        """Displays the generated report in the table widget."""
+        self.report_table.setColumnCount(len(headers))
+        self.report_table.setHorizontalHeaderLabels(headers)
+        self.report_table.setRowCount(len(data))
+        for row, row_data in enumerate(data):
+            for col, item in enumerate(row_data):
+                self.report_table.setItem(row, col, QTableWidgetItem(str(item)))
+
+    def export_to_excel(self):
+        """Exports the current report table data to an Excel file."""
+        if self.report_table.rowCount() == 0:
+            QMessageBox.warning(self, "خطا", "جدول گزارش خالی است و نمی‌تواند صادر شود.")
+            return
+
+        file_name, _ = QFileDialog.getSaveFileName(self, "ذخیره گزارش اکسل", "", "Excel Files (*.xlsx)")
+        if file_name:
+            if not file_name.endswith(".xlsx"):
+                file_name += ".xlsx"
+
+            headers = [self.report_table.horizontalHeaderItem(i).text() for i in range(self.report_table.columnCount())]
+            data = []
+            for row in range(self.report_table.rowCount()):
+                row_data = [self.report_table.item(row, col).text() for col in range(self.report_table.columnCount())]
+                data.append(row_data)
+
+            df = pd.DataFrame(data, columns=headers)
+            try:
+                df.to_excel(file_name, index=False)
+                QMessageBox.information(self, "موفقیت", f"گزارش با موفقیت به {file_name} صادر شد.")
+            except Exception as e:
+                QMessageBox.critical(self, "خطا", f"خطا در صادرات به اکسل: {e}")
+
+    def export_to_pdf(self):
+        """Exports the current report table data to a PDF file."""
+        if self.report_table.rowCount() == 0:
+            QMessageBox.warning(self, "خطا", "جدول گزارش خالی است و نمی‌تواند صادر شود.")
+            return
+
+        file_name, _ = QFileDialog.getSaveFileName(self, "ذخیره گزارش PDF", "", "PDF Files (*.pdf)")
+        if file_name:
+            if not file_name.endswith(".pdf"):
+                file_name += ".pdf"
+
+            headers = [self.report_table.horizontalHeaderItem(i).text() for i in range(self.report_table.columnCount())]
+            data = []
+            for row in range(self.report_table.rowCount()):
+                row_data = [self.report_table.item(row, col).text() for col in range(self.report_table.columnCount())]
+                data.append(row_data)
+
+            try:
+                pdf = FPDF(unit="mm", format="A4")
+                pdf.add_page()
+                try:
+                    pdf.add_font("ArialUnicode", "", FONT_PATH, uni=True)
+                    pdf.set_font("ArialUnicode", size=10)
+                except Exception as font_err:
+                    QMessageBox.warning(self, "خطا در فونت", f"فونت '{FONT_PATH}' پیدا نشد یا مشکل دارد. گزارش ممکن است فارسی را به درستی نمایش ندهد: {font_err}")
+                    pdf.set_font("Arial", size=10) # Fallback to default font
+
+                col_width = pdf.w / (len(headers) + 1)
+                row_height = 8
+
+                # Headers
+                # FPDF's multi_cell doesn't handle RTL well natively without hacks for headers.
+                # For simplicity, we'll just use cell for headers.
+                # For proper RTL in FPDF, you might need to reverse text or use a specialized library.
+                for header in headers:
+                    pdf.cell(col_width, row_height, txt=header, border=1, align='C')
+                pdf.ln(row_height)
+
+                # Data
+                for row_data in data:
+                    for item in row_data:
+                        # For RTL text in FPDF, you might need to reverse the string or use bidi algorithm.
+                        # For simplicity, we'll use it as is.
+                        pdf.multi_cell(col_width, row_height, txt=str(item), border=1, align='C', ln=3, max_line_height=pdf.font_size)
+                    pdf.ln(row_height)
+
+                pdf.output(file_name)
+                QMessageBox.information(self, "موفقیت", f"گزارش با موفقیت به {file_name} صادر شد.")
+            except Exception as e:
+                QMessageBox.critical(self, "خطا", f"خطا در صادرات به PDF: {e}")
+
+
+# --- ۵. کلاس اصلی برنامه ---
+
+class TransportManagementApp(QMainWindow):
+    """Main application class integrating all modules."""
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("سیستم مدیریت حمل و نقل")
+        self.setGeometry(100, 100, 1400, 900) # Larger initial window size
+
+        # Initialize database
+        init_db()
+        self.session = Session()
+
+        # Initialize controllers
+        self.driver_controller = DriverController(self.session)
+        self.vehicle_controller = VehicleController(self.session)
+        self.shift_controller = ShiftController(self.session)
+        self.mission_controller = MissionController(self.session)
+
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
+
+        self.stacked_widget = QStackedWidget()
+        self.main_layout.addWidget(self.stacked_widget)
+
+        self._init_ui()
+
+    def _init_ui(self):
+        """Initializes and connects all UI widgets."""
+        self.main_window_ui = MainWindow()
+        self.driver_management_ui = DriverManagementWidget(self.driver_controller)
+        self.vehicle_management_ui = VehicleManagementWidget(self.vehicle_controller)
+        self.shift_management_ui = ShiftManagementWidget(self.shift_controller, self.driver_controller)
+        self.mission_management_ui = MissionManagementWidget(self.mission_controller, self.driver_controller, self.vehicle_controller)
+        self.dashboard_ui = DashboardWidget(self.driver_controller, self.vehicle_controller, self.mission_controller)
+        self.reports_ui = ReportsWidget(self.driver_controller, self.vehicle_controller, self.mission_controller)
+
+        self.stacked_widget.addWidget(self.main_window_ui) # Index 0: Main/Home
+        self.stacked_widget.addWidget(self.driver_management_ui) # Index 1
+        self.stacked_widget.addWidget(self.vehicle_management_ui) # Index 2
+        self.stacked_widget.addWidget(self.shift_management_ui) # Index 3
+        self.stacked_widget.addWidget(self.mission_management_ui) # Index 4
+        self.stacked_widget.addWidget(self.dashboard_ui) # Index 5
+        self.stacked_widget.addWidget(self.reports_ui) # Index 6
+
+        # Connect navigation signals from main_window_ui
+        self.main_window_ui.driver_btn.clicked.connect(lambda: self.set_current_page(1))
+        self.main_window_ui.vehicle_btn.clicked.connect(lambda: self.set_current_page(2))
+        self.main_window_ui.shift_btn.clicked.connect(lambda: self.set_current_page(3))
+        self.main_window_ui.mission_btn.clicked.connect(lambda: self.set_current_page(4))
+        self.main_window_ui.dashboard_btn.clicked.connect(lambda: self.set_current_page(5, refresh_dashboard=True))
+        self.main_window_ui.reports_btn.clicked.connect(lambda: self.set_current_page(6))
+
+        # Connect "Back to Main" button on each sub-widget
+        for i in range(1, self.stacked_widget.count()):
+            widget = self.stacked_widget.widget(i)
+            # All widgets now inherit BaseWidget and have back_to_main_button
+            widget.back_to_main_button.clicked.connect(lambda: self.set_current_page(0))
+
+    def set_current_page(self, index, refresh_dashboard=False):
+        """Sets the current page in the stacked widget, with optional refresh."""
+        self.stacked_widget.setCurrentIndex(index)
+        if refresh_dashboard and index == 5: # Only refresh dashboard when navigating to it
+            self.dashboard_ui.refresh_dashboard()
+
+    def closeEvent(self, event):
+        """Handles application close event, ensuring database session is closed."""
+        self.session.close()
+        event.accept()
+
+# --- ۶. اجرای برنامه ---
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+
+    # Set a default font for the entire application to ensure Persian text displays correctly
+    # 'Segoe UI' is a good default for Windows. You might also consider 'Tahoma' or 'Arial'
+    # or specific Persian fonts like 'B Nazanin' if you have them installed on your system.
+    font = QFont("Segoe UI")
+    font.setPointSize(10) # Adjust font size if needed
+    app.setFont(font)
+
+    window = TransportManagementApp()
+    window.show()
+    sys.exit(app.exec())
